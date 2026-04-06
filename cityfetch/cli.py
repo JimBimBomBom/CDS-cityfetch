@@ -22,6 +22,9 @@ from .language_service import fetch_language_codes
 from .outputs.sql_generator import SQLGenerator
 from .outputs.json_generator import JSONGenerator
 from .outputs.csv_generator import CSVGenerator
+from .registry import ORASClient, ArtifactMetadata
+from .merge import DataMerger
+from datetime import datetime, timezone
 
 # Configure logging
 logging.basicConfig(
@@ -125,6 +128,22 @@ def cli(ctx: click.Context, version: bool) -> None:
     default=None,
     help="Secret token for webhook authentication (sent as X-Webhook-Secret header).",
 )
+@click.option(
+    "--push",
+    is_flag=True,
+    help="Push result to OCI registry after fetch.",
+)
+@click.option(
+    "--registry",
+    default=None,
+    help="Registry URL for push (e.g., ghcr.io/filip/cds-cityfetch).",
+)
+@click.option(
+    "--merge-with",
+    "merge_with",
+    default=None,
+    help="Merge with existing file before pushing (path to existing data file).",
+)
 def fetch_command(
     languages: str,
     output: str | None,
@@ -138,6 +157,9 @@ def fetch_command(
     dry_run: bool,
     webhook_url: str | None,
     webhook_secret: str | None,
+    push: bool,
+    registry: str | None,
+    merge_with: str | None,
 ) -> None:
     """
     Fetch city data from Wikidata.
@@ -288,6 +310,65 @@ def fetch_command(
                     
             except Exception as exc:
                 click.echo(f"⚠ Failed to send webhook notification: {exc}", err=True)
+        
+        # Handle merge-with workflow
+        if merge_with:
+            click.echo(f"Merging with existing data from {merge_with}...")
+            merger = DataMerger()
+            existing_cities = merger.load_existing(Path(merge_with))
+            
+            if existing_cities:
+                click.echo(f"Loaded {len(existing_cities)} existing cities")
+                all_cities = merger.merge(existing_cities, all_cities, strategy="upsert")
+                
+                # Regenerate output file with merged data
+                output_file = generator.generate(all_cities, output_path, work_dir)
+                click.echo(f"✓ Successfully wrote {len(all_cities)} merged cities to {output_file}")
+            else:
+                click.echo("No existing data found, using fresh fetch only")
+        
+        # Push to registry if requested
+        if push and registry:
+            try:
+                token = os.environ.get("GITHUB_TOKEN")
+                if not token:
+                    click.echo("Error: GITHUB_TOKEN environment variable not set", err=True)
+                    click.echo("Set it with: export GITHUB_TOKEN=ghp_xxxxxxxxxxxx", err=True)
+                    sys.exit(1)
+                
+                client = ORASClient(token=token)
+                
+                # Generate tag from first language + timestamp
+                primary_lang = lang_list[0] if lang_list else "unknown"
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                tag = f"{primary_lang}-{timestamp}"
+                
+                # Create metadata
+                metadata = ArtifactMetadata(
+                    registry=registry,
+                    tag=tag,
+                    fetched_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    record_count=len(all_cities),
+                    languages=lang_list,
+                    format=output_format,
+                )
+                
+                click.echo(f"Pushing to {registry}:{tag}...")
+                client.push(output_file, registry, tag, metadata)
+                click.echo(f"✓ Successfully pushed to {registry}:{tag}")
+                
+                # Also update latest tag
+                latest_tag = f"{primary_lang}-latest"
+                click.echo(f"Updating {registry}:{latest_tag}...")
+                client.push(output_file, registry, latest_tag, metadata)
+                click.echo(f"✓ Successfully updated {registry}:{latest_tag}")
+                
+            except Exception as exc:
+                click.echo(f"Error pushing to registry: {exc}", err=True)
+                sys.exit(1)
+        elif push and not registry:
+            click.echo("Error: --push requires --registry to be specified", err=True)
+            sys.exit(1)
         
     except Exception as exc:
         click.echo(f"Error writing output file: {exc}", err=True)

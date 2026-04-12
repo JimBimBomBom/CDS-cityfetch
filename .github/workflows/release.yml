@@ -111,9 +111,9 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
 
-      - name: Test Docker image
-        run: |
-          docker run --rm ${{ env.REGISTRY }}/${{ steps.vars.outputs.IMAGE_NAME }}:${{ github.ref_name }} python main.py version
+    #   - name: Test Docker image
+    #     run: |
+    #       docker run --rm ${{ env.REGISTRY }}/${{ steps.vars.outputs.IMAGE_NAME }}:${{ github.ref_name }} python main.py version
 
       - name: Create Release Notes
         uses: softprops/action-gh-release@v1

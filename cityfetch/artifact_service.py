@@ -10,6 +10,7 @@ Implements upsert logic: merge new data with existing, keeping non-null values.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ def pull_language_data(language: str) -> Optional[list[CityData]]:
         
         # Try to pull using oras CLI
         with tempfile.TemporaryDirectory() as tmpdir:
-            output_file = Path(tmpdir) / f"{language}_cities.json"
+            output_file = Path(tmpdir) / f"{language}_cities.csv"
             
             result = subprocess.run(
                 ["oras", "pull", ref, "-o", str(tmpdir)],
@@ -64,28 +65,30 @@ def pull_language_data(language: str) -> Optional[list[CityData]]:
                 return None
             
             # Find and parse the pulled file
-            json_files = list(Path(tmpdir).glob("*.json"))
-            if not json_files:
-                logger.warning(f"[artifact] No JSON files found in pulled artifact for {language}")
+            csv_files = list(Path(tmpdir).glob("*.csv"))
+            if not csv_files:
+                logger.warning(f"[artifact] No CSV files found in pulled artifact for {language}")
                 return None
-            
-            with open(json_files[0], "r", encoding="utf-8") as f:
-                data = json.load(f)
             
             # Convert to CityData objects
             cities = []
-            for city_dict in data.get("cities", []):
-                cities.append(CityData(
-                    wikidata_id=city_dict["city_id"],
-                    city_name=city_dict["city_name"],
-                    language=city_dict["language"],
-                    latitude=city_dict["latitude"],
-                    longitude=city_dict["longitude"],
-                    country=city_dict.get("country"),
-                    country_code=city_dict.get("country_code"),
-                    admin_region=city_dict.get("admin_region"),
-                    population=city_dict.get("population"),
-                ))
+            with open(csv_files[0], "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        cities.append(CityData(
+                            wikidata_id=row["city_id"],
+                            city_name=row["city_name"],
+                            language=row["language"],
+                            latitude=float(row["latitude"]) if row["latitude"] else 0.0,
+                            longitude=float(row["longitude"]) if row["longitude"] else 0.0,
+                            country=row["country"] or None,
+                            country_code=row["country_code"] or None,
+                            admin_region=row["admin_region"] or None,
+                            population=int(row["population"]) if row["population"] else None,
+                        ))
+                    except (ValueError, KeyError):
+                        continue
             
             logger.info(f"[artifact] Pulled {len(cities)} cities for {language}")
             return cities
@@ -125,35 +128,36 @@ def push_language_data(
         logger.info(f"[artifact] Tagging existing latest as previous for {language}")
         _retag_existing(language, token)
         
-        # Prepare the JSON file
-        json_data = {
-            "metadata": {
-                "language": language,
-                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "source": "Wikidata",
-                "tool": "CDS-CityFetch",
-                "total_records": len(cities),
-            },
-            "cities": [
-                {
-                    "city_id": c.wikidata_id,
-                    "city_name": c.city_name,
-                    "language": c.language,
-                    "latitude": c.latitude,
-                    "longitude": c.longitude,
-                    "country": c.country,
-                    "country_code": c.country_code,
-                    "admin_region": c.admin_region,
-                    "population": c.population,
-                }
-                for c in cities
-            ]
-        }
+        # Prepare the CSV file
+        fieldnames = [
+            "city_id",
+            "city_name",
+            "language",
+            "latitude",
+            "longitude",
+            "country",
+            "country_code",
+            "admin_region",
+            "population",
+        ]
         
         with tempfile.TemporaryDirectory() as tmpdir:
-            json_file = Path(tmpdir) / f"{language}_cities.json"
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            csv_file = Path(tmpdir) / f"{language}_cities.csv"
+            with open(csv_file, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for c in cities:
+                    writer.writerow({
+                        "city_id": c.wikidata_id,
+                        "city_name": c.city_name,
+                        "language": c.language,
+                        "latitude": c.latitude,
+                        "longitude": c.longitude,
+                        "country": c.country,
+                        "country_code": c.country_code,
+                        "admin_region": c.admin_region,
+                        "population": c.population,
+                    })
             
             ref = _get_artifact_reference(language)
             logger.info(f"[artifact] Pushing {len(cities)} cities for {language} to {ref}")
@@ -173,7 +177,7 @@ def push_language_data(
             
             # Push the artifact
             result = subprocess.run(
-                ["oras", "push", ref, str(json_file), "--artifact-type", "application/cityfetch-data"],
+                ["oras", "push", ref, str(csv_file), "--artifact-type", "application/cityfetch-data"],
                 capture_output=True,
                 text=True,
                 timeout=120

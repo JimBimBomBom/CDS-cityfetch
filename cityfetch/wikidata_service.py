@@ -3,12 +3,9 @@ wikidata_service.py
 -------------------
 Fetches maximum city data from Wikidata SPARQL endpoint.
 
-Uses multi-pass approach for reliability:
-  - Pass 1: Core data (id, name, lat, lon)
-  - Pass 2: Country
-  - Pass 3: Population
-  - Pass 4: Country code
-  - Pass 5: Admin region
+Uses a two-pass approach for reliability:
+  - Pass 1: Core data per settlement type (city + strict villages)
+  - Pass 2: Combined enrichment (country, population, admin region in one query)
 
 All cities are kept - no filtering. Missing data is stored as null.
 """
@@ -30,7 +27,7 @@ SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 HTTP_TIMEOUT_SECONDS = 60
 
 # Rate limiting - keeps us within Wikidata's limits
-BATCH_SIZE = 50
+BATCH_SIZE = 200
 DELAY_BETWEEN_BATCHES = 1.0
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0
@@ -98,65 +95,100 @@ def _chunk(items: list, size: int) -> list[list]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
+def _extract_qid(uri: str) -> str:
+    """Extract QID from a Wikidata URI."""
+    return uri.rsplit("/", 1)[-1] if uri else ""
+
+
+# Settlement types we query individually to keep each query lightweight.
+# The value is a tuple of (Wikidata QID, optional extra SPARQL constraints).
+# Q515 "city" is the core type and covers towns and capital cities automatically.
+# Q532 "village" is extremely broad, so we restrict to substantial villages only:
+#   - at least 20 Wikipedia sitelinks (well-known internationally)
+#   - population > 1,000 (genuine settlement, not a hamlet)
+_SETTLEMENT_TYPES: dict[str, tuple[str, str]] = {
+    "city": ("wd:Q515", ""),
+    "village": (
+        "wd:Q532",
+        """          ?city wikibase:sitelinks ?sitelinks .
+          FILTER(?sitelinks >= 20)
+          ?city wdt:P1082 ?pop .
+          FILTER(?pop > 1000)""",
+    ),
+}
+
+
 def fetch_cities(language: str) -> list[CityData]:
     """
-    Fetch all city data for a language using multi-pass approach.
+    Fetch all city data for a language using lightweight per-type queries.
     
-    This is the main and only method - always fetches maximum data.
-    Takes ~20-25 minutes per language but gets all available data.
+    Pass 1 fetches core data per settlement type (city + strict villages).
+    Pass 2 runs a single combined enrichment query for country, population,
+    and admin region per batch.
     """
-    logger.info(f"[{language}] Starting maximum data fetch (~20-25 minutes)...")
+    logger.info(f"[{language}] Starting lightweight fetch...")
     
-    # ========================================================================
-    # PASS 1: Core Data
-    # ========================================================================
-    logger.info(f"[{language}] Pass 1/5: Core data (id, name, coordinates)...")
+    # ====================================================================
+    # PASS 1: Core Data per settlement type (lightweight, no ORDER BY)
+    # ====================================================================
+    cities: dict[str, CityData] = {}
     
-    query = f"""
-    SELECT ?city ?label ?lat ?lon WHERE {{
-      ?city wdt:P31 wd:Q515 .
-      ?city wdt:P625 ?coord .
-      ?city rdfs:label ?label .
-      FILTER(LANG(?label) = "{language}" || LANG(?label) = "en")
-      BIND(geof:latitude(?coord) AS ?lat)
-      BIND(geof:longitude(?coord) AS ?lon)
-    }}
-    ORDER BY ASC(?city)"""
-    
-    rows = _execute_query(query, language, "core")
-    if not rows:
-        logger.error(f"[{language}] Failed to fetch core data")
-        return []
-    
-    cities = {}
-    for row in rows:
-        try:
-            city_uri = row.get("city", "").strip()
-            if not city_uri:
+    for type_name, (type_qid, extra_filter) in _SETTLEMENT_TYPES.items():
+        logger.info(f"[{language}] Pass 1: Fetching {type_name}...")
+
+        query = f"""
+        SELECT DISTINCT ?city ?cityLabel ?lat ?lon WHERE {{
+          ?city wdt:P31/wdt:P279* {type_qid} .
+          ?city wdt:P625 ?coord .{extra_filter}
+          BIND(geof:latitude(?coord) AS ?lat)
+          BIND(geof:longitude(?coord) AS ?lon)
+          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{language},en" }}
+        }}
+        LIMIT 100000"""
+        
+        rows = _execute_query(query, language, f"base-{type_name}")
+        new_count = 0
+        for row in rows:
+            try:
+                qid = _extract_qid(row.get("city", ""))
+                if not qid or qid in cities:
+                    continue
+                
+                label = row.get("cityLabel", "").strip()
+                # wikibase:label falls back to the QID string when no label exists;
+                # treat that as missing so we don't store "Q12345" as a city name
+                if label.startswith("Q") and label[1:].isdigit():
+                    label = ""
+                
+                cities[qid] = CityData(
+                    wikidata_id=qid,
+                    city_name=label,
+                    language=language,
+                    latitude=float(row.get("lat", 0)),
+                    longitude=float(row.get("lon", 0)),
+                )
+                new_count += 1
+            except Exception:
                 continue
-            
-            cities[city_uri.rsplit("/", 1)[-1]] = CityData(
-                wikidata_id=city_uri.rsplit("/", 1)[-1],
-                city_name=row.get("label", "").strip(),
-                language=language,
-                latitude=float(row.get("lat", 0)),
-                longitude=float(row.get("lon", 0)),
-            )
-        except Exception:
-            continue
-    
-    total = len(cities)
-    logger.info(f"[{language}] Pass 1 complete: {total} cities")
+        
+        logger.info(
+            f"[{language}] {type_name}: {len(rows)} rows, "
+            f"{new_count} new cities, total: {len(cities)}"
+        )
+        time.sleep(DELAY_BETWEEN_BATCHES)
     
     if not cities:
+        logger.error(f"[{language}] Failed to fetch any core data")
         return []
     
     city_ids = list(cities.keys())
+    total = len(cities)
+    logger.info(f"[{language}] Pass 1 complete: {total} unique cities")
     
-    # ========================================================================
-    # PASS 2: Country
-    # ========================================================================
-    logger.info(f"[{language}] Pass 2/5: Country data...")
+    # ====================================================================
+    # PASS 2: Enrichment (country + population + admin region in one shot)
+    # ====================================================================
+    logger.info(f"[{language}] Pass 2/2: Enriching country, population & admin region...")
     
     batches = _chunk(city_ids, BATCH_SIZE)
     failed = 0
@@ -164,141 +196,71 @@ def fetch_cities(language: str) -> list[CityData]:
     for i, batch in enumerate(batches, 1):
         values = " ".join(f"wd:{qid}" for qid in batch)
         query = f"""
-        SELECT ?city ?countryLabel WHERE {{
+        SELECT ?city ?countryLabel ?pop ?adminLabel WHERE {{
           VALUES ?city {{ {values} }}
           OPTIONAL {{
             ?city wdt:P17 ?country .
             ?country rdfs:label ?countryLabel .
-            FILTER(LANG(?countryLabel) = "{language}" || LANG(?countryLabel) = "en")
+            FILTER(LANG(?countryLabel) = "{language}")
+          }}
+          OPTIONAL {{ ?city wdt:P1082 ?pop }}
+          OPTIONAL {{
+            ?city wdt:P131 ?admin .
+            ?admin rdfs:label ?adminLabel .
+            FILTER(LANG(?adminLabel) = "{language}")
           }}
         }}"""
         
-        rows = _execute_query(query, language, f"country-{i}/{len(batches)}")
+        rows = _execute_query(query, language, f"enrich-{i}/{len(batches)}")
         if rows:
             for row in rows:
                 try:
-                    qid = row.get("city", "").rsplit("/", 1)[-1]
-                    if qid in cities and (val := row.get("countryLabel", "").strip()):
+                    qid = _extract_qid(row.get("city", ""))
+                    if qid not in cities:
+                        continue
+                    
+                    if val := row.get("countryLabel", "").strip():
                         cities[qid].country = val
-                except Exception:
-                    continue
-        else:
-            failed += 1
-        
-        if i % 10 == 0 or i == len(batches):
-            with_country = sum(1 for c in cities.values() if c.country)
-            logger.info(f"[{language}] Country: {i}/{len(batches)} batches, {with_country}/{total} cities")
-        
-        if i < len(batches):
-            time.sleep(DELAY_BETWEEN_BATCHES)
-    
-    with_country = sum(1 for c in cities.values() if c.country)
-    logger.info(f"[{language}] Pass 2 complete: {with_country}/{total} cities have country ({failed} failed batches)")
-    
-    # ========================================================================
-    # PASS 3: Population
-    # ========================================================================
-    logger.info(f"[{language}] Pass 3/5: Population data...")
-    
-    batches = _chunk(city_ids, BATCH_SIZE)
-    failed = 0
-    
-    for i, batch in enumerate(batches, 1):
-        values = " ".join(f"wd:{qid}" for qid in batch)
-        query = f"""
-        SELECT ?city ?pop WHERE {{
-          VALUES ?city {{ {values} }}
-          OPTIONAL {{ ?city wdt:P1082 ?pop }}
-        }}"""
-        
-        rows = _execute_query(query, language, f"pop-{i}/{len(batches)}")
-        if rows:
-            for row in rows:
-                try:
-                    qid = row.get("city", "").rsplit("/", 1)[-1]
-                    if qid in cities and (val := row.get("pop", "").strip()):
+                    if val := row.get("pop", "").strip():
                         cities[qid].population = int(float(val))
+                    if val := row.get("adminLabel", "").strip():
+                        cities[qid].admin_region = val
                 except (ValueError, TypeError):
                     continue
         else:
             failed += 1
         
         if i % 10 == 0 or i == len(batches):
+            with_country = sum(1 for c in cities.values() if c.country)
             with_pop = sum(1 for c in cities.values() if c.population)
-            logger.info(f"[{language}] Population: {i}/{len(batches)} batches, {with_pop}/{total} cities")
-        
-        if i < len(batches):
-            time.sleep(DELAY_BETWEEN_BATCHES)
-    
-    with_pop = sum(1 for c in cities.values() if c.population)
-    logger.info(f"[{language}] Pass 3 complete: {with_pop}/{total} cities have population")
-    
-    # ========================================================================
-    # PASS 4: Country Code
-    # ========================================================================
-    logger.info(f"[{language}] Pass 4/5: Country codes...")
-    
-    # Get unique country entities that we found
-    country_qids = set()
-    for city in cities.values():
-        if city.country:
-            # We need the country QID, but we only have the name
-            # For now, we'll skip this pass - it requires mapping names back to QIDs
-            pass
-    
-    logger.info(f"[{language}] Pass 4: Country code lookup requires QID mapping (skipped)")
-    
-    # ========================================================================
-    # PASS 5: Admin Region
-    # ========================================================================
-    logger.info(f"[{language}] Pass 5/5: Admin region data...")
-    
-    batches = _chunk(city_ids, BATCH_SIZE)
-    failed = 0
-    
-    for i, batch in enumerate(batches, 1):
-        values = " ".join(f"wd:{qid}" for qid in batch)
-        query = f"""
-        SELECT ?city ?adminLabel WHERE {{
-          VALUES ?city {{ {values} }}
-          OPTIONAL {{
-            ?city wdt:P131 ?admin .
-            ?admin rdfs:label ?adminLabel .
-            FILTER(LANG(?adminLabel) = "{language}" || LANG(?adminLabel) = "en")
-          }}
-        }}"""
-        
-        rows = _execute_query(query, language, f"admin-{i}/{len(batches)}")
-        if rows:
-            for row in rows:
-                try:
-                    qid = row.get("city", "").rsplit("/", 1)[-1]
-                    if qid in cities and (val := row.get("adminLabel", "").strip()):
-                        cities[qid].admin_region = val
-                except Exception:
-                    continue
-        else:
-            failed += 1
-        
-        if i % 10 == 0 or i == len(batches):
             with_admin = sum(1 for c in cities.values() if c.admin_region)
-            logger.info(f"[{language}] Admin: {i}/{len(batches)} batches, {with_admin}/{total} cities")
+            logger.info(
+                f"[{language}] Enrich: {i}/{len(batches)} batches, "
+                f"C={with_country} P={with_pop} A={with_admin}/{total}"
+            )
         
         if i < len(batches):
             time.sleep(DELAY_BETWEEN_BATCHES)
     
+    with_country = sum(1 for c in cities.values() if c.country)
+    with_pop = sum(1 for c in cities.values() if c.population)
     with_admin = sum(1 for c in cities.values() if c.admin_region)
-    logger.info(f"[{language}] Pass 5 complete: {with_admin}/{total} cities have admin region")
+    logger.info(
+        f"[{language}] Pass 2 complete: "
+        f"country={with_country}, pop={with_pop}, admin={with_admin} "
+        f"({failed} failed batches)"
+    )
     
-    # ========================================================================
+    # ====================================================================
     # SUMMARY
-    # ========================================================================
+    # ====================================================================
     result = list(cities.values())
     
     logger.info(f"[{language}] === FETCH COMPLETE ===")
     logger.info(f"[{language}] Total cities: {len(result)}")
-    logger.info(f"[{language}] With country: {with_country} ({100*with_country//len(result)}%)")
-    logger.info(f"[{language}] With population: {with_pop} ({100*with_pop//len(result)}%)")
-    logger.info(f"[{language}] With admin region: {with_admin} ({100*with_admin//len(result)}%)")
+    if result:
+        logger.info(f"[{language}] With country: {with_country} ({100*with_country//len(result)}%)")
+        logger.info(f"[{language}] With population: {with_pop} ({100*with_pop//len(result)}%)")
+        logger.info(f"[{language}] With admin region: {with_admin} ({100*with_admin//len(result)}%)")
     
     return result

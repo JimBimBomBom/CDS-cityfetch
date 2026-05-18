@@ -3,7 +3,7 @@
 CDS-CityFetch
 -------------
 Fetches city data from Wikidata for all predefined languages
-and stores them as separate JSON files.
+and stores them as separate CSV files.
 
 Usage:
     docker run --rm -v ./output:/data cityfetch
@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -63,31 +64,32 @@ def save_language_file(
     fetched_at: str,
 ) -> tuple[Path, int]:
     """
-    Save cities for a single language to a JSON file.
+    Save cities for a single language to a CSV file.
     
     All cities are saved, including those with incomplete data.
-    Missing fields are stored as null.
+    Missing fields are stored as empty strings.
     
     Returns:
         Tuple of (file_path, record_count)
     """
-    # Build the document structure
-    document = {
-        "metadata": {
-            "language": language,
-            "fetched_at": fetched_at,
-            "source": "Wikidata",
-            "tool": "CDS-CityFetch",
-            "tool_version": VERSION,
-            "total_records": len(cities),
-        },
-        "cities": [city_to_dict(city) for city in cities],
-    }
+    fieldnames = [
+        "city_id",
+        "city_name",
+        "language",
+        "latitude",
+        "longitude",
+        "country",
+        "country_code",
+        "admin_region",
+        "population",
+    ]
     
-    # Write file
-    output_file = output_dir / f"{language}_cities.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(document, f, indent=2, ensure_ascii=False)
+    output_file = output_dir / f"{language}_cities.csv"
+    with open(output_file, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for city in cities:
+            writer.writerow(city_to_dict(city))
     
     logger.info("Saved %d cities to %s", len(cities), output_file.name)
     return output_file, len(cities)
@@ -271,7 +273,7 @@ def show_version() -> None:
     print(__description__)
     print()
     print("City data source: Wikidata (https://www.wikidata.org)")
-    print("Output format: JSON (one file per language)")
+    print("Output format: CSV (one file per language)")
 
 
 def show_help() -> None:
@@ -382,7 +384,7 @@ def main() -> None:
     logger.info("Languages: %d", len(language_stats))
     logger.info("Total records: %d", total_records)
     logger.info("Output directory: %s", output_dir)
-    logger.info("Files created: %d language files + manifest.json", len(language_stats))
+    logger.info("Files created: %d CSV files + manifest.json", len(language_stats))
     logger.info("=" * 60)
 
 
